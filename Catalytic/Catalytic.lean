@@ -57,6 +57,7 @@ def State.write (s : State) (r : ThreeReg) (v : Val) : State :=
   (State.write s r v).read r = v := by
   cases r <;> cases s <;> simp [State.write, State.read]
 
+-- Writing to a register preserves the other registers
 @[simp] lemma read_write_ne (s : State) {r r' : ThreeReg} (v : Val) (h : r' ≠ r) :
   (State.write s r v).read r' = s.read r' := by
   cases r <;> cases r' <;> cases s <;> simp [State.write, State.read] at *
@@ -286,6 +287,17 @@ def Instr.rev : Instr → Instr
   a - (b + c) + b + c = a := by
   ring
 
+@[simp] lemma exec_add_const
+    (src dst : ThreeReg) (h : src ≠ dst) (k : Val) (s : State) :
+  Instr.exec (Instr.add_const src k dst h) s =
+    State.write s dst (s.read dst + (s.read src + k)) := by
+    simp [Instr.exec, add_assoc]
+
+@[simp] lemma exec_add_const_rev
+    (src dst : ThreeReg) (h : src ≠ dst) (k : Val) (s : State) :
+  Instr.exec (Instr.add_const_rev src k dst h) s =
+    State.write s dst (s.read dst - (s.read src + k)) := rfl
+
 lemma instr_rev (i : Instr) (s : State) :
   Instr.exec (Instr.rev i) (Instr.exec i s) = s := by
   apply State.ext_read
@@ -423,6 +435,15 @@ lemma exec_append (p q : Program) (s : State) :
   | cons i p ih =>
       simp [Program.exec, List.cons_append, ih]
 
+@[simp]
+lemma exec_singleton (i : Instr) (s : State) :
+  Program.exec [i] s = Instr.exec i s := by
+  -- [i] = i :: []
+  -- Program.exec (i :: []) s = Program.exec [] (Instr.exec i s)
+  have := exec_append [i] [] s
+  -- rewrite Program.exec [] u = u
+  simp [Program.exec]
+
 lemma exec_perm (σ : ThreeReg ≃ ThreeReg) (p : Program) (s : State) :
   Program.exec (Program.perm σ p) (State.perm σ s)
     = State.perm σ (Program.exec p s) := by
@@ -433,6 +454,7 @@ lemma exec_perm (σ : ThreeReg ≃ ThreeReg) (p : Program) (s : State) :
       have h' := ih (Instr.exec i s)
       simpa [Program.exec, Program.perm, instr_exec_perm] using h'
 
+/- Proven that the reverse program is correct!-/
 lemma exec_rev (p : Program) (s : State) :
   Program.exec (Program.rev p) (Program.exec p s) = s := by
   induction p generalizing s with
@@ -449,3 +471,480 @@ lemma exec_rev2 (p : Program) (s : State) :
       simp [Program.exec, Program.rev]
   | cons i p ih =>
       simp [Program.exec, Program.rev, exec_append, instr_rev2, ih]
+
+/- Some desired properties that a program wants to have-/
+-- “p adds a constant x to register r, while preserving other registers”
+def writes_add (p : Program) (r : ThreeReg) (x : Val) : Prop :=
+  ∀ s, Program.exec p s = State.write s r (s.read r + x)
+
+/- If a program can writes_add, its inverse can write_add_rev-/
+lemma writes_add_rev
+  (p : Program)
+  (r : ThreeReg)
+  (x : Val)
+  (h : writes_add p r x) :
+  writes_add (Program.rev p) r (-x) := by
+  intro t
+  let s := Program.exec (Program.rev p) t
+  have hs_def : s = Program.exec p.rev t := rfl
+  -- 1. Use writes_add on s:
+  have h_p_s : p.exec s = State.write s r (s.read r + x) := h s
+  -- 2. Use reversibility: p (p.rev t) = t
+  have h_rev : p.exec s = t := by
+    -- exec_rev2 : Program.exec p (Program.exec (Program.rev p) s) = s
+    simpa [s, hs_def] using (exec_rev2 p t)
+  -- Combine them: t = write s r (s.read r + x)
+  have ht : t = s.write r (s.read r + x) := by
+    -- from h_p_s and h_rev
+    simpa [h_rev,eq_comm] using h_p_s.symm
+
+  apply State.ext_read
+  intro r'
+  by_cases hr' : r' = r
+  · subst hr'
+    -- First compute t.read r from ht
+    have h_tr : t.read r' = s.read r' + x := by
+      -- ht : t = write s r (s.read r + x)
+      -- so t.read r = (write s r (s.read r + x)).read r = s.read r + x
+      simp [ht, read_write_same]
+
+    -- We want s.read r = t.read r - x
+    have hs_eq : s.read r' = t.read r' - x := by
+      -- simple Int algebra using h_tr
+      calc
+        s.read r'
+            = s.read r' + x - x := by ring
+        _   = (s.read r' + x) - x := by rfl
+        _   = t.read r' - x := by
+                simp [h_tr]  -- replace t.read r with s.read r + x
+
+    -- RHS: (State.write t r (t.read r - x)).read r = t.read r - x
+    -- so we just rewrite with hs_eq
+    simpa [read_write_same, hs_eq]
+  · -- Case r' ≠ r
+    -- We need: s.read r' = (State.write t r (t.read r - x)).read r'
+    -- From ht, t is "write-at-r" of s, so all other regs are preserved:
+    have h_tr' : t.read r' = s.read r' := by
+      -- t = write s r (s.read r + x), reading at r' ≠ r
+      have : r' ≠ r := hr'
+      simp [ht, read_write_ne _ _ this]  -- t.read r' = s.read r'
+
+    -- And writing t at r preserves r' as well:
+    have h_write_t : (State.write t r (t.read r - x)).read r' = t.read r' := by
+      have : r' ≠ r := hr'
+      simp [read_write_ne _ _ this]
+
+    -- Combine:
+    calc
+      s.read r'
+          = t.read r' := by simp [h_tr']
+      _   = (State.write t r (t.read r - x)).read r' := by
+              simp [h_write_t]
+
+
+/- Define a half ADD gadget first-/
+def halfADD
+    (ri rk : ThreeReg) (P1 : Program) (hik : ri ≠ rk) : Program :=
+  [Instr.add_const_rev ri 0 rk hik] ++
+  P1 ++
+  [Instr.add_const ri 0 rk hik] ++
+  Program.rev P1
+
+lemma halfADD_correct
+  (ri rk : ThreeReg)
+  (P1 : Program)
+  (hik : ri ≠ rk)
+  (x : Val)
+  (hP1 : writes_add P1 ri x) :
+  writes_add (halfADD ri rk P1 hik) rk x := by
+  intro s
+  -- states after each phase
+  set s1 := Program.exec [Instr.add_const_rev ri 0 rk hik] s with hs1
+  set s2 := Program.exec P1 s1 with hs2
+  set s3 := Program.exec [Instr.add_const ri 0 rk hik] s2 with hs3
+  set s4 := Program.exec (Program.rev P1) s3 with hs4
+    -- identify full exec with s4
+  have h_exec :
+    Program.exec (halfADD ri rk P1 hik) s = s4 := by
+    unfold halfADD
+    -- Now goal is:
+    -- Program.exec ([sub] ++ P1 ++ [add] ++ P1.rev) s = s4
+
+    -- Step 1: peel off [sub]
+    have h_step1 :
+      Program.exec ([Instr.add_const_rev ri 0 rk hik] ++ P1 ++ [Instr.add_const ri 0 rk hik] ++ P1.rev) s
+        = Program.exec (P1 ++ [Instr.add_const ri 0 rk hik] ++ P1.rev) s1 := by
+        -- use exec_append with p = [sub], q = P1 ++ [add] ++ P1.rev
+        have h := exec_append
+          ([Instr.add_const_rev ri 0 rk hik] : Program)
+          (P1 ++ [Instr.add_const ri 0 rk hik] ++ P1.rev)
+          s
+        -- h :
+        --   Program.exec ([Instr.add_const_rev ...] ++ (P1 ++ [add] ++ P1.rev)) s
+        --     = Program.exec (P1 ++ [add] ++ P1.rev) (Program.exec [Instr.add_const_rev ...] s)
+        -- rewrite associativity and the definition of s1
+        simpa [List.append_assoc, s1, hs1] using h
+
+    -- Step 2: peel off P1
+    have h_step2 :
+      Program.exec (P1 ++ [Instr.add_const ri 0 rk hik] ++ P1.rev) s1
+        = Program.exec ([Instr.add_const ri 0 rk hik] ++ P1.rev) s2 := by
+        -- exec_append with p = P1, q = [add] ++ P1.rev, starting from s1
+        have h := exec_append
+          (P1 : Program)
+          ([Instr.add_const ri 0 rk hik] ++ P1.rev)
+          s1
+        -- h :
+        --   Program.exec (P1 ++ ([add] ++ P1.rev)) s1
+        --     = Program.exec ([add] ++ P1.rev) (Program.exec P1 s1)
+        simpa [List.append_assoc, s2, hs2] using h
+
+    -- Step 3: peel off [add]
+    have h_step3 :
+      Program.exec ([Instr.add_const ri 0 rk hik] ++ P1.rev) s2
+        = Program.exec P1.rev s3 := by
+        -- exec_append with p = [add], q = P1.rev, starting from s2
+        have h := exec_append
+          ([Instr.add_const ri 0 rk hik] : Program)
+          (P1.rev)
+          s2
+        -- h :
+        --   Program.exec ([add] ++ P1.rev) s2
+        --     = Program.exec P1.rev (Program.exec [add] s2)
+        simpa [s3, hs3] using h
+
+    -- Now chain the three steps and finally use hs4
+    calc
+      Program.exec ([Instr.add_const_rev ri 0 rk hik] ++ P1 ++ [Instr.add_const ri 0 rk hik] ++ P1.rev) s
+          = Program.exec (P1 ++ [Instr.add_const ri 0 rk hik] ++ P1.rev) s1 := h_step1
+      _   = Program.exec ([Instr.add_const ri 0 rk hik] ++ P1.rev) s2 := h_step2
+      _   = Program.exec P1.rev s3 := h_step3
+      _   = s4 := by simp [s4]
+
+  -- 2. Now prove s4 = write s rk (s.read rk + x) by extensionality
+  ------------------------------------------------------------------
+    -- We want: s4 = State.write s rk (s.read rk + x)
+  apply (h_exec.trans ?_)
+  apply State.ext_read
+  intro q
+  by_cases hq_rk : q = rk
+  ------------------------------------------------------------------
+  -- CASE 1: q = rk  (the destination register)
+  ------------------------------------------------------------------
+  · subst hq_rk
+
+    -- s1: rk := rk - ri
+    have hrk_s1 :
+      s1.read q = s.read q - (s.read ri + 0) := by
+      -- use your lemma about add_const_rev with k=0
+      simp [s1, exec_add_const_rev, read_write_same]
+
+    have hri_s1 :
+      s1.read ri = s.read ri := by
+      -- add_const_rev only writes rk
+      have : ri ≠ q := hik
+      simp [s1, exec_add_const_rev, this, read_write_ne]
+
+    -- s2: P1 on s1: ri := ri + x, rk unchanged
+    have hP1_s1 :
+      Program.exec P1 s1 = State.write s1 ri (s1.read ri + x) :=
+      hP1 s1
+
+    have hrk_s2 :
+      s2.read q = s1.read q := by
+      have : q ≠ ri := by simpa [ne_comm] using hik
+      simp [s2, hP1_s1, read_write_ne _ _ this]
+
+    have hri_s2 :
+      s2.read ri = s1.read ri + x := by
+      simp [s2, hP1_s1, read_write_same]
+
+    -- s3: rk := rk + (ri + 0)
+    have hrk_s3 :
+      s3.read q = s2.read q + (s2.read ri + 0) := by
+      simp [s3, exec_add_const, read_write_same]
+
+    -- express s3.read rk in terms of the original s
+    have hrk_s3' :
+      s3.read q = s.read q + x := by
+      calc
+        s3.read q
+            = s2.read q + (s2.read ri + 0) := hrk_s3
+        _   = s1.read q + ((s1.read ri + x) + 0) := by
+                simp [hrk_s2, hri_s2]
+        _   = s.read q - (s.read ri + 0) + (s.read ri + x) := by
+                simp [hrk_s1, hri_s1, add_comm, add_left_comm, add_assoc]
+        _   = s.read q + x := by
+                ring
+
+    -- s4: P1.rev on s3; it changes ri, not rk
+    have hP1_rev : writes_add (Program.rev P1) ri (-x) :=
+      writes_add_rev P1 ri x hP1
+
+    have hP1_rev_s3 :
+      Program.exec (Program.rev P1) s3 =
+        State.write s3 ri (s3.read ri - x) :=
+      hP1_rev s3
+
+    have hrk_s4 :
+      s4.read q = s3.read q := by
+      have : q ≠ ri := by simpa [ne_comm] using hik
+      simp [s4, hP1_rev_s3, read_write_ne _ _ this]
+
+    -- final rk
+    have : s4.read q = s.read q + x := by
+      simp [hrk_s4, hrk_s3']
+    -- RHS: write s rk (s.read rk + x)
+    simpa [read_write_same] using this
+
+  ------------------------------------------------------------------
+  -- CASE 2: q ≠ rk  (“other registers”)
+  ------------------------------------------------------------------
+  · have hq_ne_rk : q ≠ rk := hq_rk
+
+    -- We have to treat q = ri and q ≠ ri separately!
+
+    by_cases hq_ri : q = ri
+    --------------------------------------------------------------
+    -- 2a: q = ri
+    --------------------------------------------------------------
+    · subst hq_ri
+
+      -- s1: sub step only touches rk, so ri unchanged
+      have hri_s1 :
+        s1.read q = s.read q := by
+        have : q ≠ rk := hik
+        simp [s1, exec_add_const_rev, this, read_write_ne]
+
+      -- s2: P1 adds x to ri
+      have hP1_s1 :
+        Program.exec P1 s1 = State.write s1 q (s1.read q + x) :=
+        hP1 s1
+
+      have hri_s2 :
+        s2.read q = s1.read q + x := by
+        simp [s2, hP1_s1, read_write_same]
+
+      -- s3: add step only touches rk, so ri unchanged
+      have hri_s3 :
+        s3.read q = s2.read q := by
+        simp [s3, exec_add_const, read_write_ne _ _ hq_ne_rk]
+
+      -- s4: P1.rev subtracts x from ri
+      have hP1_rev : writes_add (Program.rev P1) q (-x) :=
+        writes_add_rev P1 q x hP1
+      have hP1_rev_s3 :
+        Program.exec (Program.rev P1) s3 =
+          State.write s3 q (s3.read q - x) :=
+        hP1_rev s3
+
+      have hri_s4 :
+        s4.read q = s3.read q - x := by
+        simp [s4, hP1_rev_s3, read_write_same]
+
+      -- combine everything: net effect on ri is 0
+      have : s4.read q = s.read q := by
+        calc
+          s4.read q
+              = s3.read q - x := hri_s4
+          _   = (s2.read q) - x := by simp [hri_s3]
+          _   = (s1.read q + x) - x := by simp [hri_s2]
+          _   = s1.read q := by ring
+          _   = s.read q := by simp [hri_s1]
+
+      -- RHS: write at rk preserves ri since ri ≠ rk
+      have : s4.read q = (State.write s rk (s.read rk + x)).read q := by
+        simp [this, read_write_ne _ _ hik]
+
+      simpa using this
+
+    --------------------------------------------------------------
+    -- 2b: q ≠ ri and q ≠ rk
+    --------------------------------------------------------------
+    · have hq_ne_ri : q ≠ ri := hq_ri
+
+      -- s1: only rk changes
+      have h_s1 : s1.read q = s.read q := by
+        simp [s1, exec_add_const_rev, read_write_ne _ _ hq_ne_rk]
+
+      -- s2: P1 writes ri, q ≠ ri
+      have hP1_s1 :
+        Program.exec P1 s1 = State.write s1 ri (s1.read ri + x) :=
+        hP1 s1
+
+      have h_s2 : s2.read q = s1.read q := by
+        simp [s2, hP1_s1, read_write_ne _ _ hq_ne_ri]
+
+      -- s3: only rk changes
+      have h_s3 : s3.read q = s2.read q := by
+        simp [s3, exec_add_const, read_write_ne _ _ hq_ne_rk]
+
+      -- s4: P1.rev writes ri, q ≠ ri
+      have hP1_rev : writes_add (Program.rev P1) ri (-x) :=
+        writes_add_rev P1 ri x hP1
+      have hP1_rev_s3 :
+        Program.exec (Program.rev P1) s3 =
+          State.write s3 ri (s3.read ri - x) :=
+        hP1_rev s3
+
+      have h_s4 : s4.read q = s3.read q := by
+        simp [s4, hP1_rev_s3, read_write_ne _ _ hq_ne_ri]
+
+      -- chain: s4.read q = s.read q
+      have : s4.read q = s.read q := by
+        simp [h_s4, h_s3, h_s2, h_s1]
+
+      -- RHS: write at rk preserves q since q ≠ rk
+      have : s4.read q = (State.write s rk (s.read rk + x)).read q := by
+        simp [this, read_write_ne _ _ hq_ne_rk]
+
+      simpa using this
+
+
+
+/- We can finally start defining ADD program-/
+def ADD
+  (ri rj rk : ThreeReg)
+  (P1 P2 : Program)
+  (h : distinct3 ri rj rk)
+  : Program :=
+  let hki : rk ≠ ri := h.2.2
+  let hik : ri ≠ rk := by
+    simpa [ne_comm] using hki
+  let hjk : rj ≠ rk := h.2.1
+  [Instr.add_const_rev ri 0 rk hik] ++ P1 ++ [Instr.add_const ri 0 rk hik] ++ P1.rev ++
+  [Instr.add_const_rev rj 0 rk hjk] ++ P2 ++ [Instr.add_const rj 0 rk hjk] ++ P2.rev
+
+/- We now try to prove that this synthesize is correct-/
+lemma ADD_eq_two_halves
+  (ri rj rk : ThreeReg)
+  (P1 P2 : Program)
+  (h : distinct3 ri rj rk) :
+  let hki : rk ≠ ri := h.2.2
+  let hik : ri ≠ rk := by simpa [ne_comm] using hki
+  let hjk : rj ≠ rk := h.2.1
+  ADD ri rj rk P1 P2 h
+    = halfADD ri rk P1 hik ++ halfADD rj rk P2 hjk := by
+  intros hki hik hjk
+  -- unfold both and massage with append associativity
+  unfold ADD halfADD
+  -- left is [ri-sub] ++ P1 ++ [ri-add] ++ P1.rev ++ [rj-sub] ++ P2 ++ [rj-add] ++ P2.rev
+  -- right is ([ri-sub] ++ P1 ++ [ri-add] ++ P1.rev) ++ ([rj-sub] ++ P2 ++ [rj-add] ++ P2.rev)
+  -- These are equal by associativity of ++
+  simp [List.append_assoc]
+
+theorem ADD_correct
+  (ri rj rk : ThreeReg)
+  (P1 P2 : Program)
+  (h : distinct3 ri rj rk)
+  (x y : Val)
+  (hP1 : writes_add P1 ri x)
+  (hP2 : writes_add P2 rj y) :
+  writes_add (ADD ri rj rk P1 P2 h) rk (x + y) := by
+  rcases h with ⟨hij, hjk, hki⟩
+  have hik : ri ≠ rk := by simpa [ne_comm] using hki
+  have hjk' : rj ≠ rk := hjk
+
+  -- half-ADD gadgets for ri and rj
+  have hhalf1 := halfADD_correct ri rk P1 hik x hP1
+  have hhalf2 := halfADD_correct rj rk P2 hjk' y hP2
+
+  intro s
+
+  -- First do the ri-half:
+  set s1 := Program.exec (halfADD ri rk P1 hik) s with hs1
+  have hs1_spec :
+      s1 = State.write s rk (s.read rk + x) := by
+    -- from hhalf1 spec
+    simpa [s1, hs1] using hhalf1 s
+
+  -- Now relate ADD to the two halves and peel via exec_append
+  have hadd_eq :
+      ADD ri rj rk P1 P2 ⟨hij, hjk, hki⟩
+        = halfADD ri rk P1 hik ++ halfADD rj rk P2 hjk' := by
+    -- reuse the lemma above, inline if you like
+    have := ADD_eq_two_halves ri rj rk P1 P2 ⟨hij, hjk, hki⟩
+    -- expand the `let`s
+    simpa [hik, hjk'] using this
+
+  have h_exec_add :
+      Program.exec (ADD ri rj rk P1 P2 ⟨hij, hjk, hki⟩) s
+        = Program.exec (halfADD rj rk P2 hjk') s1 := by
+    -- exec (p ++ q) s = exec q (exec p s)
+    have h := exec_append (halfADD ri rk P1 hik) (halfADD rj rk P2 hjk') s
+    simpa [hadd_eq, s1, hs1] using h
+
+  -- Apply the second halfADD on s1
+  have h_half2_s1 :
+      Program.exec (halfADD rj rk P2 hjk') s1
+        = State.write s1 rk (s1.read rk + y) :=
+    hhalf2 s1
+
+  -- Compose them
+  have h_exec_total :
+      Program.exec (ADD ri rj rk P1 P2 ⟨hij, hjk, hki⟩) s
+        = State.write s1 rk (s1.read rk + y) := by
+    simpa [h_exec_add] using h_half2_s1
+
+  -- We know s1.read rk = s.read rk + x
+  have hrk_s1 : s1.read rk = s.read rk + x := by
+    simp [hs1_spec, read_write_same]
+
+  -- We want to show:
+  --   Program.exec (ADD ...) s = State.write s rk (s.read rk + (x + y))
+  -- we already have h_exec_total, so rewrite and prove equality of writes.
+  apply (h_exec_total.trans ?_)
+  apply State.ext_read
+  intro q
+  by_cases hq : q = rk
+  · ----------------------------------------------------------------
+    -- Case q = rk: compute final rk value
+    ----------------------------------------------------------------
+    subst hq
+    -- LHS read rk:
+    have hL :
+        (State.write s1 q (s1.read q + y)).read q
+          = s1.read q + y := by
+      simp [read_write_same]
+    have hL' :
+        (State.write s1 q (s1.read q + y)).read q
+          = s.read q + (x + y) := by
+      -- plug in s1.read rk and reassociate
+      simp [hrk_s1, add_assoc, add_comm, add_left_comm]
+    -- RHS read rk:
+    have hR :
+        (State.write s q (s.read q + (x + y))).read q
+          = s.read q + (x + y) := by
+      simp [read_write_same]
+    -- done
+    simpa [hR] using hL'
+
+  · ----------------------------------------------------------------
+    -- Case q ≠ rk: both writes preserve q
+    ----------------------------------------------------------------
+    have hq_ne_rk : q ≠ rk := hq
+
+    -- First, show s1.read q = s.read q, since s1 = write at rk on s
+    have h_s1q : s1.read q = s.read q := by
+      have : q ≠ rk := hq_ne_rk
+      simp [hs1_spec, read_write_ne _ _ this]
+
+    -- LHS: write at rk on s1 preserves q
+    have hL :
+        (State.write s1 rk (s1.read rk + y)).read q
+          = s1.read q := by
+      simp [read_write_ne _ _ hq_ne_rk]
+
+    -- RHS: write at rk on s preserves q
+    have hR :
+        (State.write s rk (s.read rk + (x + y))).read q
+          = s.read q := by
+      simp [read_write_ne _ _ hq_ne_rk]
+
+    -- Compare them via h_s1q
+    have :
+        (State.write s1 rk (s1.read rk + y)).read q
+          = (State.write s rk (s.read rk + (x + y))).read q := by
+      simp [hL, hR, h_s1q]
+
+    simpa using this
